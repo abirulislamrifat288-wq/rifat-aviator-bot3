@@ -8,8 +8,22 @@ from pathlib import Path
 from statistics import median
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from PIL import Image, ImageOps, ImageEnhance
+import pytesseract
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -20,7 +34,6 @@ DATA_FILE = Path(os.getenv("DATA_FILE", "/tmp/history.json"))
 MAX_HISTORY = 5000
 
 
-# Render health server
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -34,12 +47,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_web_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logging.info("Web server running on port %s", port)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
-# History: oldest -> newest
 def load_history():
     try:
         data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -80,32 +90,105 @@ def percentile(values, fraction):
     return ordered[index]
 
 
-def range_summary(values):
-    if not values:
-        return "কোনো History নেই।"
+def prediction_text(values):
+    if len(values) < 20:
+        return (
+            "বিশ্লেষণের জন্য অন্তত ২০টি History দরকার।\n"
+            f"এখন আছে: {len(values)}টি"
+        )
+
+    latest = values[-1]
+    latest_bucket = bucket(latest)
+
+    following = [
+        values[i + 1]
+        for i in range(len(values) - 1)
+        if bucket(values[i]) == latest_bucket
+    ]
+
+    if len(following) < 5:
+        return (
+            "পর্যাপ্ত মিল পাওয়া যায়নি। আরও History যোগ করো।\n"
+            f"সর্বশেষ ফলাফল: {fmt(latest)}\n"
+            f"মিল পাওয়া নমুনা: {len(following)}টি"
+        )
+
+    low = percentile(following, 0.25)
+    mid = median(following)
+    high = percentile(following, 0.75)
 
     return (
-        f"Median: {fmt(median(values))}\n"
-        f"Below 2x: "
-        f"{sum(x < 2 for x in values) / len(values) * 100:.1f}%\n"
-        f"5x বা বেশি: "
-        f"{sum(x >= 5 for x in values) / len(values) * 100:.1f}%\n"
-        f"মোট রাউন্ড: {len(values)}"
+        "🔎 NEXT ROUND ANALYSIS\n\n"
+        f"সর্বশেষ ফলাফল: {fmt(latest)}\n"
+        f"ক্যাটাগরি: {latest_bucket}\n"
+        f"নমুনা: {len(following)}টি\n\n"
+        f"📊 ঐতিহাসিক 25%-75% রেঞ্জ:\n"
+        f"{fmt(low)} – {fmt(high)}\n"
+        f"Median: {fmt(mid)}\n\n"
+        "⚠️ এটি অতীতের ডেটাভিত্তিক অনুমান। "
+        "পরের রাউন্ডের নিশ্চিত ভবিষ্যদ্বাণী নয়।"
     )
+
+
+def read_multipliers(image_path):
+    image = Image.open(image_path).convert("RGB")
+
+    # OCR-এর জন্য ছবির কনট্রাস্ট ও সাইজ বাড়ানো
+    image = ImageOps.grayscale(image)
+    image = ImageOps.autocontrast(image)
+    image = ImageEnhance.Contrast(image).enhance(2)
+    image = image.resize(
+        (image.width * 2, image.height * 2)
+    )
+
+    data = pytesseract.image_to_data(
+        image,
+        config="--psm 6",
+        output_type=pytesseract.Output.DICT
+    )
+
+    found = []
+
+    for i, word in enumerate(data["text"]):
+        word = word.strip().replace(",", ".")
+
+        matches = re.findall(
+            r"(?<!\d)(\d{1,5}\.\d{1,2})",
+            word
+        )
+
+        for match in matches:
+            try:
+                value = float(match)
+                if 1 <= value <= 100000:
+                    found.append((
+                        data["top"][i],
+                        data["left"][i],
+                        value
+                    ))
+            except ValueError:
+                pass
+
+    # ওপরের সারি আগে, একই সারিতে বাম থেকে ডানে
+    found.sort(key=lambda item: (item[0], item[1]))
+
+    return [item[2] for item in found]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✈️ স্বাগতম Rifat Aviator Analysis Bot-এ!\n\n"
+        "Screenshot পাঠালে বট Multiplier পড়ার চেষ্টা করবে।\n"
+        "পড়া সংখ্যা নিশ্চিত করলে History-তে যোগ হবে।\n\n"
         "কমান্ড:\n"
-        "/add 1.45 — একটি ফলাফল যোগ\n"
-        "/bulk 7.14 6.17 3.51 — অনেক ফলাফল যোগ\n"
-        "/history — শেষ ২০টি ফলাফল\n"
-        "/analyze — History বিশ্লেষণ\n"
-        "/predict — পরবর্তী রাউন্ডের পরিসংখ্যানভিত্তিক অনুমান\n"
-        "/stats — পরিসংখ্যান\n"
-        "/clear — History মুছে ফেলা\n\n"
-        "নোট: অনুমান নিশ্চিত ভবিষ্যদ্বাণী নয়।"
+        "/add 1.45\n"
+        "/bulk 7.14 6.17 3.51\n"
+        "/history\n"
+        "/analyze\n"
+        "/predict\n"
+        "/stats\n"
+        "/clear\n\n"
+        "⚠️ Prediction নিশ্চিত নয়।"
     )
 
 
@@ -127,58 +210,115 @@ async def add_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_history(values)
 
     await update.message.reply_text(
-        f"✅ যোগ হয়েছে: {fmt(value)}\n"
-        f"মোট History: {len(values)}"
+        f"✅ যোগ হয়েছে: {fmt(value)}\nমোট History: {len(values)}"
     )
 
 
 async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "ব্যবহার:\n"
-            "/bulk 7.14 6.17 3.51 3.73\n\n"
-            "প্রথমে নতুন ফলাফল, পরে পুরোনো ফলাফল দেবে।"
+            "ব্যবহার: /bulk 7.14 6.17 3.51\n"
+            "প্রথমে নতুন, পরে পুরোনো ফলাফল দেবে।"
         )
         return
 
-    raw = " ".join(context.args)
-    parts = re.split(r"[\s,;]+", raw.strip())
-
-    if len(parts) > 1000:
-        await update.message.reply_text(
-            "একবারে সর্বোচ্চ ১০০০টি ফলাফল যোগ করা যাবে।"
-        )
-        return
+    parts = re.split(r"[\s,;]+", " ".join(context.args).strip())
 
     try:
-        new_results = [
-            float(item.lower().replace("x", ""))
-            for item in parts if item
-        ]
-
-        if not new_results or any(
-            x < 1 or x > 100000 for x in new_results
+        results = [float(x.lower().replace("x", "")) for x in parts if x]
+        if not results or len(results) > 1000 or any(
+            x < 1 or x > 100000 for x in results
         ):
             raise ValueError
-
     except ValueError:
-        await update.message.reply_text(
-            "Multiplier সঠিকভাবে দাও। যেমন:\n"
-            "/bulk 7.14 6.17 3.51 3.73"
-        )
+        await update.message.reply_text("Multiplier সঠিকভাবে দাও।")
         return
 
     values = load_history()
-
-    # User sends newest -> oldest.
-    # Internally store oldest -> newest.
-    values.extend(reversed(new_results))
+    values.extend(reversed(results))
     save_history(values)
 
     await update.message.reply_text(
-        f"✅ {len(new_results)}টি ফলাফল যোগ হয়েছে!\n"
-        f"মোট History: {len(values)}টি\n"
-        "নতুন ফলাফলগুলো সঠিক ক্রমে সংরক্ষিত হয়েছে।"
+        f"✅ {len(results)}টি ফলাফল যোগ হয়েছে!\n"
+        f"মোট History: {len(values)}টি"
+    )
+
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    photo = message.photo[-1]
+
+    await message.reply_text("🖼️ Screenshot পড়ছি, একটু অপেক্ষা করো...")
+
+    try:
+        telegram_file = await context.bot.get_file(photo.file_id)
+        image_path = "/tmp/aviator_screenshot.jpg"
+        await telegram_file.download_to_drive(image_path)
+
+        results = read_multipliers(image_path)
+
+        if len(results) < 3:
+            await message.reply_text(
+                "ছবি থেকে যথেষ্ট Multiplier পড়তে পারিনি।\n"
+                "আরও পরিষ্কার Screenshot পাঠাও।"
+            )
+            return
+
+        context.user_data["pending_results"] = results
+
+        preview = " ".join(fmt(x) for x in results[:60])
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "✅ নিশ্চিত, History-তে যোগ করো",
+                    callback_data="ocr_confirm"
+                ),
+                InlineKeyboardButton(
+                    "❌ বাতিল",
+                    callback_data="ocr_cancel"
+                )
+            ]
+        ])
+
+        await message.reply_text(
+            f"ছবি থেকে {len(results)}টি Multiplier পড়েছি।\n\n"
+            f"{preview}\n\n"
+            "ক্রমটি নতুন ফলাফল থেকে পুরোনো ফলাফল হিসেবে পড়া হয়েছে।\n"
+            "সংখ্যাগুলো ঠিক থাকলে Confirm চাপো।",
+            reply_markup=keyboard
+        )
+
+    except Exception:
+        logging.exception("OCR error")
+        await message.reply_text(
+            "ছবি পড়তে সমস্যা হয়েছে। আবার পরিষ্কার Screenshot পাঠাও।"
+        )
+
+
+async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ocr_cancel":
+        context.user_data.pop("pending_results", None)
+        await query.edit_message_text("ছবি থেকে পাওয়া ফলাফল বাতিল করা হয়েছে।")
+        return
+
+    results = context.user_data.pop("pending_results", None)
+
+    if not results:
+        await query.edit_message_text("কোনো অপেক্ষমাণ ফলাফল পাওয়া যায়নি।")
+        return
+
+    values = load_history()
+    values.extend(reversed(results))
+    save_history(values)
+
+    await query.edit_message_text(
+        f"✅ {len(results)}টি ফলাফল History-তে যোগ হয়েছে!\n"
+        f"মোট History: {len(values)}টি\n\n"
+        + prediction_text(values)
     )
 
 
@@ -190,15 +330,10 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     recent = list(reversed(values[-20:]))
-
-    lines = [
-        f"{i}. {fmt(v)}"
-        for i, v in enumerate(recent, 1)
-    ]
+    lines = [f"{i}. {fmt(v)}" for i, v in enumerate(recent, 1)]
 
     await update.message.reply_text(
-        "📜 সর্বশেষ ফলাফল (নতুনটি আগে):\n\n"
-        + "\n".join(lines)
+        "📜 সর্বশেষ ফলাফল:\n\n" + "\n".join(lines)
     )
 
 
@@ -211,84 +346,17 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    recent = values[-30:]
-
     await update.message.reply_text(
         "📊 HISTORY ANALYSIS\n\n"
-        + range_summary(values)
-        + "\n\nশেষ "
-        + str(len(recent))
-        + " রাউন্ডের বিশ্লেষণ:\n"
-        + range_summary(recent)
+        f"Median: {fmt(median(values))}\n"
+        f"Below 2x: {sum(x < 2 for x in values) / len(values) * 100:.1f}%\n"
+        f"5x বা বেশি: {sum(x >= 5 for x in values) / len(values) * 100:.1f}%\n"
+        f"মোট রাউন্ড: {len(values)}"
     )
 
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    values = load_history()
-
-    if len(values) < 20:
-        await update.message.reply_text(
-            f"বিশ্লেষণের জন্য অন্তত ২০টি History দরকার।\n"
-            f"এখন আছে: {len(values)}টি"
-        )
-        return
-
-    latest = values[-1]
-    latest_bucket = bucket(latest)
-
-    # Find historical rounds in the same multiplier category.
-    # Examine the result immediately after each matching round.
-    following = []
-
-    for i in range(len(values) - 1):
-        if bucket(values[i]) == latest_bucket:
-            following.append(values[i + 1])
-
-    if len(following) < 5:
-        await update.message.reply_text(
-            "🔎 PREDICTION ANALYSIS\n\n"
-            f"সর্বশেষ ফলাফল: {fmt(latest)}\n"
-            f"ক্যাটাগরি: {latest_bucket}\n"
-            f"একই ক্যাটাগরির পরের রাউন্ডের নমুনা: "
-            f"{len(following)}টি\n\n"
-            "এখনো পর্যাপ্ত মিল পাওয়া যায়নি। "
-            "আরও History যোগ করো।\n\n"
-            "কোনো নির্ভরযোগ্য Prediction দেওয়া যাচ্ছে না।"
-        )
-        return
-
-    low = percentile(following, 0.25)
-    mid = median(following)
-    high = percentile(following, 0.75)
-
-    labels = [
-        ("1.00x–1.99x", lambda x: x < 2),
-        ("2.00x–4.99x", lambda x: 2 <= x < 5),
-        ("5.00x–9.99x", lambda x: 5 <= x < 10),
-        ("10x+", lambda x: x >= 10),
-    ]
-
-    distribution = []
-
-    for label, test in labels:
-        count = sum(test(x) for x in following)
-        pct = count / len(following) * 100
-        distribution.append(f"{label}: {pct:.1f}%")
-
-    await update.message.reply_text(
-        "🔎 NEXT ROUND ANALYSIS\n\n"
-        f"সর্বশেষ ফলাফল: {fmt(latest)}\n"
-        f"সর্বশেষ ক্যাটাগরি: {latest_bucket}\n\n"
-        "📊 আগের একই ক্যাটাগরির পরের ফলাফল:\n"
-        f"নমুনা: {len(following)}টি\n"
-        f"ঐতিহাসিক 25%-75% রেঞ্জ: "
-        f"{fmt(low)} – {fmt(high)}\n"
-        f"Median: {fmt(mid)}\n\n"
-        "পরের ফলাফলের ঐতিহাসিক বণ্টন:\n"
-        + "\n".join(distribution)
-        + "\n\n⚠️ এটি শুধু অতীতের পরিসংখ্যান। "
-        "এটি পরের রাউন্ডের নির্ভরযোগ্য ভবিষ্যদ্বাণী নয়।"
-    )
+    await update.message.reply_text(prediction_text(load_history()))
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -310,8 +378,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for label, test in labels:
         count = sum(test(x) for x in values)
         lines.append(
-            f"{label}: {count} "
-            f"({count / len(values) * 100:.1f}%)"
+            f"{label}: {count} ({count / len(values) * 100:.1f}%)"
         )
 
     await update.message.reply_text(
@@ -345,6 +412,9 @@ def main():
     app.add_handler(CommandHandler("predict", predict))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("clear", clear_history))
+
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(CallbackQueryHandler(ocr_callback))
 
     app.run_polling()
 
