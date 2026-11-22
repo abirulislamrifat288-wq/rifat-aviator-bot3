@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: rifat-aviator-analysis-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DATA_FILE
+        value: /var/data/history.json
+    disk:
+      name: aviator-history
+      mountPath: /var/data
+      sizeGB: 1
