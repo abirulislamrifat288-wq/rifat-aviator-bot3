@@ -4,6 +4,7 @@ import re
 import json
 import logging
 import threading
+import hashlib
 from pathlib import Path
 from statistics import median
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -11,16 +12,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -33,7 +29,11 @@ logging.basicConfig(
 DATA_FILE = Path(os.getenv("DATA_FILE", "/tmp/history.json"))
 MAX_HISTORY = 5000
 
+# একই ছবি বারবার পাঠালে আবার যোগ হওয়া আটকাতে
+LAST_IMAGE_HASH = {}
 
+
+# Render health server
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -47,9 +47,12 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_web_server():
     port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logging.info("Web server running on port %s", port)
+    server.serve_forever()
 
 
+# History: oldest -> newest
 def load_history():
     try:
         data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
@@ -91,59 +94,67 @@ def percentile(values, fraction):
 
 
 def prediction_text(values):
-    if len(values) < 20:
+    if len(values) < 30:
         return (
-            "বিশ্লেষণের জন্য অন্তত ২০টি History দরকার।\n"
-            f"এখন আছে: {len(values)}টি"
+            "বিশ্লেষণের জন্য অন্তত ৩০টি History দরকার।\n"
+            f"বর্তমানে আছে: {len(values)}টি"
         )
 
     latest = values[-1]
-    latest_bucket = bucket(latest)
+    current_bucket = bucket(latest)
 
-    following = [
-        values[i + 1]
-        for i in range(len(values) - 1)
-        if bucket(values[i]) == latest_bucket
-    ]
+    estimates = []
 
-    if len(following) < 5:
-        return (
-            "পর্যাপ্ত মিল পাওয়া যায়নি। আরও History যোগ করো।\n"
-            f"সর্বশেষ ফলাফল: {fmt(latest)}\n"
-            f"মিল পাওয়া নমুনা: {len(following)}টি"
+    for round_no in range(1, 5):
+        samples = []
+
+        for i in range(len(values) - round_no):
+            if bucket(values[i]) == current_bucket:
+                samples.append(values[i + round_no])
+
+        if len(samples) < 5:
+            estimates.append(
+                f"Round {round_no}: পর্যাপ্ত তথ্য নেই "
+                f"({len(samples)}টি নমুনা)"
+            )
+            continue
+
+        low = percentile(samples, 0.25)
+        high = percentile(samples, 0.75)
+        mid = median(samples)
+
+        estimates.append(
+            f"Round {round_no}\n"
+            f"আনুমানিক Range: {fmt(low)} – {fmt(high)}\n"
+            f"Median: {fmt(mid)}\n"
+            f"নমুনা: {len(samples)}টি"
         )
 
-    low = percentile(following, 0.25)
-    mid = median(following)
-    high = percentile(following, 0.75)
-
     return (
-        "🔎 NEXT ROUND ANALYSIS\n\n"
-        f"সর্বশেষ ফলাফল: {fmt(latest)}\n"
-        f"ক্যাটাগরি: {latest_bucket}\n"
-        f"নমুনা: {len(following)}টি\n\n"
-        f"📊 ঐতিহাসিক 25%-75% রেঞ্জ:\n"
-        f"{fmt(low)} – {fmt(high)}\n"
-        f"Median: {fmt(mid)}\n\n"
-        "⚠️ এটি অতীতের ডেটাভিত্তিক অনুমান। "
-        "পরের রাউন্ডের নিশ্চিত ভবিষ্যদ্বাণী নয়।"
+        "🤖 AVIATOR AI ANALYSIS\n\n"
+        f"সর্বশেষ ফলাফল: {fmt(latest)}\n\n"
+        "🔮 পরবর্তী ৪ রাউন্ডের আনুমানিক বিশ্লেষণ:\n\n"
+        + "\n\n".join(estimates)
+        + "\n\n⚠️ এটি অতীতের ডেটাভিত্তিক পরিসংখ্যান। "
+        "নিশ্চিত ভবিষ্যদ্বাণী নয়।"
     )
 
 
+# Screenshot থেকে Multiplier পড়া
 def read_multipliers(image_path):
     image = Image.open(image_path).convert("RGB")
 
-    # OCR-এর জন্য ছবির কনট্রাস্ট ও সাইজ বাড়ানো
     image = ImageOps.grayscale(image)
     image = ImageOps.autocontrast(image)
     image = ImageEnhance.Contrast(image).enhance(2)
+
     image = image.resize(
         (image.width * 2, image.height * 2)
     )
 
     data = pytesseract.image_to_data(
         image,
-        config="--psm 6",
+        config="--psm 11",
         output_type=pytesseract.Output.DICT
     )
 
@@ -153,13 +164,14 @@ def read_multipliers(image_path):
         word = word.strip().replace(",", ".")
 
         matches = re.findall(
-            r"(?<!\d)(\d{1,5}\.\d{1,2})",
+            r"(?<!\d)(\d{1,5}\.\d{1,2})(?!\d)",
             word
         )
 
         for match in matches:
             try:
                 value = float(match)
+
                 if 1 <= value <= 100000:
                     found.append((
                         data["top"][i],
@@ -169,17 +181,28 @@ def read_multipliers(image_path):
             except ValueError:
                 pass
 
-    # ওপরের সারি আগে, একই সারিতে বাম থেকে ডানে
+    # ওপর থেকে নিচে, একই সারিতে বাম থেকে ডানে
     found.sort(key=lambda item: (item[0], item[1]))
 
-    return [item[2] for item in found]
+    results = [item[2] for item in found]
+
+    # একই multiplier পরপর পড়া হলে একবার রাখা
+    cleaned = []
+
+    for value in results:
+        if not cleaned or value != cleaned[-1]:
+            cleaned.append(value)
+
+    return cleaned
 
 
+# Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✈️ স্বাগতম Rifat Aviator Analysis Bot-এ!\n\n"
-        "Screenshot পাঠালে বট Multiplier পড়ার চেষ্টা করবে।\n"
-        "পড়া সংখ্যা নিশ্চিত করলে History-তে যোগ হবে।\n\n"
+        "শুধু Aviator History Screenshot পাঠাও।\n"
+        "বট নিজে থেকে ছবি পড়ে পরবর্তী ৪ রাউন্ডের "
+        "আনুমানিক বিশ্লেষণ দেখাবে।\n\n"
         "কমান্ড:\n"
         "/add 1.45\n"
         "/bulk 7.14 6.17 3.51\n"
@@ -188,10 +211,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/predict\n"
         "/stats\n"
         "/clear\n\n"
-        "⚠️ Prediction নিশ্চিত নয়।"
+        "⚠️ অনুমান নিশ্চিত ফলাফল নয়।"
     )
 
 
+# Add one result
 async def add_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
         await update.message.reply_text("ব্যবহার: /add 1.45")
@@ -199,8 +223,10 @@ async def add_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         value = float(context.args[0].lower().replace("x", ""))
+
         if not 1 <= value <= 100000:
             raise ValueError
+
     except ValueError:
         await update.message.reply_text("সঠিক Multiplier দাও।")
         return
@@ -210,26 +236,34 @@ async def add_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_history(values)
 
     await update.message.reply_text(
-        f"✅ যোগ হয়েছে: {fmt(value)}\nমোট History: {len(values)}"
+        f"✅ যোগ হয়েছে: {fmt(value)}\n"
+        f"মোট History: {len(values)}"
     )
 
 
+# Add many results
 async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "ব্যবহার: /bulk 7.14 6.17 3.51\n"
-            "প্রথমে নতুন, পরে পুরোনো ফলাফল দেবে।"
+            "ব্যবহার:\n"
+            "/bulk 7.14 6.17 3.51 3.73\n\n"
+            "প্রথমে নতুন ফলাফল, পরে পুরোনো ফলাফল দেবে।"
         )
         return
 
     parts = re.split(r"[\s,;]+", " ".join(context.args).strip())
 
     try:
-        results = [float(x.lower().replace("x", "")) for x in parts if x]
+        results = [
+            float(x.lower().replace("x", ""))
+            for x in parts if x
+        ]
+
         if not results or len(results) > 1000 or any(
             x < 1 or x > 100000 for x in results
         ):
             raise ValueError
+
     except ValueError:
         await update.message.reply_text("Multiplier সঠিকভাবে দাও।")
         return
@@ -244,84 +278,73 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# Automatic screenshot handler
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    photo = message.photo[-1]
 
-    await message.reply_text("🖼️ Screenshot পড়ছি, একটু অপেক্ষা করো...")
+    await message.reply_text(
+        "🖼️ Screenshot পড়ছি এবং বিশ্লেষণ করছি..."
+    )
 
     try:
+        photo = message.photo[-1]
+
         telegram_file = await context.bot.get_file(photo.file_id)
-        image_path = "/tmp/aviator_screenshot.jpg"
+
+        image_path = (
+            f"/tmp/aviator_{message.from_user.id}_"
+            f"{message.message_id}.jpg"
+        )
+
         await telegram_file.download_to_drive(image_path)
+
+        # Duplicate screenshot detection
+        image_bytes = Path(image_path).read_bytes()
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+
+        user_id = message.from_user.id
+
+        if LAST_IMAGE_HASH.get(user_id) == image_hash:
+            await message.reply_text(
+                "এই Screenshot আগেই পাঠানো হয়েছে। "
+                "একই ছবি আবার যোগ করা হয়নি।"
+            )
+            return
 
         results = read_multipliers(image_path)
 
-        if len(results) < 3:
+        if len(results) < 10:
             await message.reply_text(
                 "ছবি থেকে যথেষ্ট Multiplier পড়তে পারিনি।\n"
                 "আরও পরিষ্কার Screenshot পাঠাও।"
             )
             return
 
-        context.user_data["pending_results"] = results
+        # Screenshot থেকে পাওয়া ফলাফল নতুন -> পুরোনো
+        values = load_history()
+        values.extend(reversed(results))
+        save_history(values)
 
-        preview = " ".join(fmt(x) for x in results[:60])
+        LAST_IMAGE_HASH[user_id] = image_hash
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ নিশ্চিত, History-তে যোগ করো",
-                    callback_data="ocr_confirm"
-                ),
-                InlineKeyboardButton(
-                    "❌ বাতিল",
-                    callback_data="ocr_cancel"
-                )
-            ]
-        ])
+        preview = " ".join(fmt(x) for x in results[:30])
 
         await message.reply_text(
-            f"ছবি থেকে {len(results)}টি Multiplier পড়েছি।\n\n"
-            f"{preview}\n\n"
-            "ক্রমটি নতুন ফলাফল থেকে পুরোনো ফলাফল হিসেবে পড়া হয়েছে।\n"
-            "সংখ্যাগুলো ঠিক থাকলে Confirm চাপো।",
-            reply_markup=keyboard
+            f"✅ Screenshot থেকে {len(results)}টি ফলাফল পড়েছি।\n"
+            f"পড়া সংখ্যাগুলো: {preview}\n\n"
+            + prediction_text(values)
         )
 
     except Exception:
-        logging.exception("OCR error")
+        logging.exception("Screenshot analysis error")
+
         await message.reply_text(
-            "ছবি পড়তে সমস্যা হয়েছে। আবার পরিষ্কার Screenshot পাঠাও।"
+            "Screenshot বিশ্লেষণ করতে সমস্যা হয়েছে। "
+            "আরও পরিষ্কার Screenshot পাঠিয়ে আবার চেষ্টা করো।"
         )
 
 
-async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "ocr_cancel":
-        context.user_data.pop("pending_results", None)
-        await query.edit_message_text("ছবি থেকে পাওয়া ফলাফল বাতিল করা হয়েছে।")
-        return
-
-    results = context.user_data.pop("pending_results", None)
-
-    if not results:
-        await query.edit_message_text("কোনো অপেক্ষমাণ ফলাফল পাওয়া যায়নি।")
-        return
-
-    values = load_history()
-    values.extend(reversed(results))
-    save_history(values)
-
-    await query.edit_message_text(
-        f"✅ {len(results)}টি ফলাফল History-তে যোগ হয়েছে!\n"
-        f"মোট History: {len(values)}টি\n\n"
-        + prediction_text(values)
-    )
-
-
+# History command
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     values = load_history()
 
@@ -330,13 +353,19 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     recent = list(reversed(values[-20:]))
-    lines = [f"{i}. {fmt(v)}" for i, v in enumerate(recent, 1)]
+
+    lines = [
+        f"{i}. {fmt(v)}"
+        for i, v in enumerate(recent, 1)
+    ]
 
     await update.message.reply_text(
-        "📜 সর্বশেষ ফলাফল:\n\n" + "\n".join(lines)
+        "📜 সর্বশেষ ফলাফল (নতুনটি আগে):\n\n"
+        + "\n".join(lines)
     )
 
 
+# Analyze command
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     values = load_history()
 
@@ -346,19 +375,29 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    recent = values[-30:]
+
     await update.message.reply_text(
         "📊 HISTORY ANALYSIS\n\n"
+        f"মোট রাউন্ড: {len(values)}\n"
         f"Median: {fmt(median(values))}\n"
-        f"Below 2x: {sum(x < 2 for x in values) / len(values) * 100:.1f}%\n"
-        f"5x বা বেশি: {sum(x >= 5 for x in values) / len(values) * 100:.1f}%\n"
-        f"মোট রাউন্ড: {len(values)}"
+        f"Below 2x: "
+        f"{sum(x < 2 for x in values) / len(values) * 100:.1f}%\n"
+        f"5x বা বেশি: "
+        f"{sum(x >= 5 for x in values) / len(values) * 100:.1f}%\n\n"
+        f"শেষ {len(recent)} রাউন্ডের Median: "
+        f"{fmt(median(recent))}"
     )
 
 
+# Predict command
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(prediction_text(load_history()))
+    await update.message.reply_text(
+        prediction_text(load_history())
+    )
 
 
+# Stats command
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     values = load_history()
 
@@ -377,8 +416,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for label, test in labels:
         count = sum(test(x) for x in values)
+
         lines.append(
-            f"{label}: {count} ({count / len(values) * 100:.1f}%)"
+            f"{label}: {count} "
+            f"({count / len(values) * 100:.1f}%)"
         )
 
     await update.message.reply_text(
@@ -386,16 +427,22 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# Clear history
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_history([])
-    await update.message.reply_text("সব History মুছে ফেলা হয়েছে।")
+    await update.message.reply_text(
+        "সব History মুছে ফেলা হয়েছে।"
+    )
 
 
+# Main function
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
 
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN সেট করা নেই।")
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN সেট করা নেই।"
+        )
 
     threading.Thread(
         target=start_web_server,
@@ -413,11 +460,16 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("clear", clear_history))
 
-    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    app.add_handler(CallbackQueryHandler(ocr_callback))
+    # Screenshot automatically process
+    app.add_handler(
+        MessageHandler(filters.PHOTO, photo_handler)
+    )
+
+    logging.info("Aviator Bot started!")
 
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
+
